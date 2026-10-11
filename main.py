@@ -68,18 +68,24 @@ def build_atempo_filter(speed: float) -> str:
     filters.append(f"atempo={current:.4f}")
     return ",".join(filters)
 
-def check_has_audio(ffmpeg_exe: str, input_path: str) -> bool:
+def probe_video(ffmpeg_exe: str, input_path: str):
+    duration = 0.0
+    has_audio = False
     try:
         proc = subprocess.run(
             [ffmpeg_exe, "-i", input_path],
             stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             universal_newlines=True,
-            timeout=5,
+            timeout=10,
         )
-        return "Audio:" in proc.stderr
-    except Exception:
-        return True
+        dur_match = re.search(r"Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)", proc.stderr)
+        if dur_match:
+            duration = parse_time_to_seconds(dur_match.group(1))
+        has_audio = "Audio:" in proc.stderr
+    except Exception as exc:
+        print(f"[WARN] Video probe failed: {exc}")
+    return duration, has_audio
 
 def process_video_task(task_id: str, input_path: str, speed: float):
     if task_id not in tasks:
@@ -92,11 +98,12 @@ def process_video_task(task_id: str, input_path: str, speed: float):
     output_path = tasks[task_id]["output_path"]
     video_speed = 1.0 / speed
 
-    tasks[task_id]["status"] = "processing"
+    tasks[task_id]["status"] = "Analyzing video..."
     stderr_lines = []
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        has_audio = check_has_audio(ffmpeg_exe, input_path)
+        duration, has_audio = probe_video(ffmpeg_exe, input_path)
+        target_duration = duration * video_speed if duration > 0 else 0.0
 
         if has_audio:
             atempo_filter = build_atempo_filter(speed)
@@ -110,7 +117,8 @@ def process_video_task(task_id: str, input_path: str, speed: float):
             ffmpeg_exe, '-i', input_path,
             '-filter_complex', filter_complex,
             *map_args,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '28',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+            '-threads', '2',
             '-movflags', '+faststart',
             output_path, '-y'
         ]
@@ -121,36 +129,39 @@ def process_video_task(task_id: str, input_path: str, speed: float):
             stdout=subprocess.DEVNULL,
             universal_newlines=True
         )
-        
-        duration_secs = 0.0
-        
-        for line in process.stderr:
-            stderr_lines.append(line)
-            if not duration_secs:
-                dur_match = re.search(r"Duration:\s*(\d{2}:\d{2}:\d{2}\.\d{2})", line)
-                if dur_match:
-                    duration_secs = parse_time_to_seconds(dur_match.group(1))
-            
-            time_match = re.search(r"time=\s*(\d{2}:\d{2}:\d{2}\.\d{2})", line)
-            if time_match and duration_secs > 0:
-                current_secs = parse_time_to_seconds(time_match.group(1))
-                target_duration = duration_secs * video_speed
-                progress = (current_secs / target_duration) * 100
+
+        tasks[task_id]["status"] = "Processing... 0%"
+        read_buffer = ""
+
+        while True:
+            chunk = process.stderr.read(128)
+            if not chunk:
+                break
+            stderr_lines.append(chunk)
+            read_buffer += chunk
+
+            times = re.findall(r'time=(\d+:\d+:\d+(?:\.\d+)?)', read_buffer)
+            if times and target_duration > 0:
+                latest_time = times[-1]
+                current_secs = parse_time_to_seconds(latest_time)
+                percent = min(99, max(1, int((current_secs / target_duration) * 100)))
                 if task_id in tasks:
-                    tasks[task_id]["progress"] = min(99, int(progress))
+                    tasks[task_id]["progress"] = percent
+                    tasks[task_id]["status"] = f"Processing... {percent}%"
+                read_buffer = read_buffer[-256:]
                 
         process.wait()
         
         if task_id in tasks:
             if process.returncode == 0:
-                tasks[task_id]["status"] = "completed"
+                tasks[task_id]["status"] = "Complete!"
                 tasks[task_id]["progress"] = 100
                 tasks[task_id]["outputUrl"] = f"/api/download/{task_id}"
                 tasks[task_id]["output_url"] = f"/api/download/{task_id}"
             else:
-                err_detail = "".join(stderr_lines[-10:])
+                err_detail = "".join(stderr_lines[-20:])
                 print(f"[ERROR] Task {task_id} FFmpeg failed (code {process.returncode}):\n{err_detail}")
-                tasks[task_id]["status"] = "error"
+                tasks[task_id]["status"] = "Error"
                 tasks[task_id]["progress"] = 0
                 tasks[task_id]["error"] = f"FFmpeg processing failed (code {process.returncode})"
                 try:
@@ -160,7 +171,7 @@ def process_video_task(task_id: str, input_path: str, speed: float):
     except Exception as exc:
         print(f"[ERROR] Task {task_id} exception: {exc}")
         if task_id in tasks:
-            tasks[task_id]["status"] = "error"
+            tasks[task_id]["status"] = "Error"
             tasks[task_id]["progress"] = 0
             tasks[task_id]["error"] = str(exc)
         try:
